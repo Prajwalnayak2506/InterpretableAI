@@ -4,6 +4,5 @@ dictionaries/
 data/ 
 datasets/ 
 models/ 
-*.pt 
 *.pth 
 *.pkl 
