@@ -1,0 +1,9 @@
+venv/ 
+__pycache__/ 
+dictionaries/ 
+data/ 
+datasets/ 
+models/ 
+*.pt 
+*.pth 
+*.pkl 
