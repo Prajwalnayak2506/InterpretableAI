@@ -6,18 +6,19 @@ import os
 import sys
 from collections import defaultdict
 
-import torch as t
-# We import their utilities
+# FIX: Import torch directly so both 'torch' and 't' work if needed, 
+# but we will use 'torch' everywhere to be safe.
+import torch
+import torch as t 
+
 from attribution import patching_effect, jvp
 from circuit_plotting import plot_circuit, plot_circuit_posaligned
-from dictionary_learning import AutoEncoder
-from data_loading_utils import load_examples, load_examples_nopair
 from dictionary_loading_utils import load_saes_and_submodules
 from nnsight import LanguageModel
+from data_loading_utils import load_examples
 from coo_utils import sparse_reshape
 
-# --- OVERRIDE: Fast Circuit Generation ---
-def get_circuit_fast(
+def get_circuit_diagnostic(
     clean,
     patch,
     model,
@@ -31,305 +32,235 @@ def get_circuit_fast(
     aggregation="sum",
     nodes_only=False,
     parallel_attn=False,
-    node_threshold=0.1,
 ):
     all_submods = ([embed] if embed is not None else []) + [
         submod for layer_submods in zip(attns, mlps, resids) for submod in layer_submods
     ]
 
-    print("   DEBUG: Starting Patching Effect (Forward Pass)...")
+    print("   DEBUG: Running 1-Step Patching (IG)...")
     
-    # --- FIX 1: Pass steps=1 directly ---
     effects, deltas, grads, total_effect = patching_effect(
-        clean,
-        patch,
-        model,
-        all_submods,
-        dictionaries,
-        metric_fn,
-        metric_kwargs=metric_kwargs,
-        method="ig", 
-        steps=1 
+        clean, patch, model, all_submods, dictionaries, metric_fn,
+        metric_kwargs=metric_kwargs, method="ig", steps=1 
     )
-    print("   DEBUG: Forward Pass Complete. Filtering Features...")
+    print("   DEBUG: Forward Pass Complete.")
 
+    # 1. DIAGNOSTIC: Check Max Values & Determine Threshold safely
+    max_scores = []
+    print("   📊 Analyzing Attribution Scores...")
+    for i, resid in enumerate(resids):
+        eff = effects[resid]
+        try:
+            # FAIL-SAFE: Convert to dense tensor first
+            if hasattr(eff, 'to_tensor'):
+                dense_eff = eff.to_tensor()
+            else:
+                dense_eff = eff
+            
+            m = dense_eff.abs().max().item()
+        except Exception as e:
+            # If standard max fails, try a fallback for sparse
+            try:
+                if hasattr(eff, 'values') and eff.values.numel() > 0:
+                    m = eff.values.abs().max().item()
+                else:
+                    m = 0.0
+            except:
+                m = 0.0
+        
+        max_scores.append(m)
+        print(f"      Layer {i} Max Score: {m:.6f}")
+
+    # Set Dynamic Threshold: 10% of the global max score
+    global_max = max(max_scores) if max_scores else 0
+    if global_max == 0:
+        print("   ❌ FATAL: All attribution scores are 0.0. Check your Metric function!")
+        # Fallback to avoid crash
+        return None, None, None, 0.1
+
+    dynamic_threshold = global_max * 0.10
+    print(f"   ⚡ Auto-Selected Threshold: {dynamic_threshold:.6f} (10% of max {global_max:.6f})")
+
+    # 2. Filter Features using Dynamic Threshold (Robust Method)
+    active_features_dict = {}
+    print("   🔍 Extracting Active Features...")
+    
+    for i, resid in enumerate(resids):
+        eff = effects[resid]
+        try:
+            # Again, convert to dense to be safe
+            if hasattr(eff, 'to_tensor'):
+                dense_eff = eff.to_tensor().detach().cpu()
+            else:
+                dense_eff = eff.detach().cpu()
+            
+            # Find indices where activation > threshold
+            # 1. Create boolean mask
+            mask = dense_eff.abs() > dynamic_threshold
+            
+            # 2. Find non-zero indices (Using explicit 'torch' now)
+            nonzero_indices = torch.nonzero(mask)
+            
+            if nonzero_indices.numel() > 0:
+                # The feature index is the last column
+                feats = nonzero_indices[:, -1].unique().tolist()
+                active_features_dict[f"resid_{i}"] = feats
+                print(f"      -> Layer {i}: Kept {len(feats)} features")
+            else:
+                active_features_dict[f"resid_{i}"] = []
+                print(f"      -> Layer {i}: 0 features > {dynamic_threshold:.6f}")
+                
+        except Exception as e:
+            print(f"      -> Layer {i} Error: {e}")
+            active_features_dict[f"resid_{i}"] = []
+
+    # 3. Standard Circuit Construction
     features_by_submod = {
-        submod: effects[submod].abs() > node_threshold for submod in all_submods
+        submod: effects[submod].abs() > dynamic_threshold for submod in all_submods
     }
 
     n_layers = len(resids)
-
-    # --- FIX 2: Reorder Nodes (Add 'y' LAST) ---
-    # The plotter assumes the first node has sequence length. 
-    # 'y' is scalar, so if it's first, the plotter crashes.
     nodes = {} 
-    
-    if embed is not None:
-        nodes["embed"] = effects[embed]
+    if embed is not None: nodes["embed"] = effects[embed]
     for i in range(n_layers):
         nodes[f"attn_{i}"] = effects[attns[i]]
         nodes[f"mlp_{i}"] = effects[mlps[i]]
         nodes[f"resid_{i}"] = effects[resids[i]]
-        
-    # Add 'y' last
     nodes["y"] = total_effect
 
-    if nodes_only:
-        if aggregation == "sum":
-            for k in nodes:
-                if k != "y":
-                    nodes[k] = nodes[k].sum(dim=1)
-        nodes = {k: v.mean(dim=0) for k, v in nodes.items()}
-        return nodes, None
-
-    # --- FIX 3: Use 'dict' (not lambda) for saving ---
     edges = defaultdict(dict)
-    
     edges[f"resid_{len(resids) - 1}"] = {
         "y": effects[resids[-1]].to_tensor().flatten().to_sparse()
     }
 
     def N(upstream, downstream, midstream=[]):
-        result = jvp(
-            clean,
-            model,
-            dictionaries,
-            downstream,
-            features_by_submod[downstream],
-            upstream,
-            grads[downstream],
-            deltas[upstream],
+        return jvp(
+            clean, model, dictionaries, downstream,
+            features_by_submod[downstream], upstream,
+            grads[downstream], deltas[upstream],
             intermediate_stopgrads=midstream,
         )
-        return result
 
-    print("   DEBUG: Computing Edges (Backward Pass)...")
+    print("   DEBUG: Computing Edges...")
     for layer in reversed(range(len(resids))):
-        resid = resids[layer]
-        mlp = mlps[layer]
-        attn = attns[layer]
-
-        MR_effect = N(mlp, resid)
-        AR_effect = N(attn, resid, [mlp])
-        edges[f"mlp_{layer}"][f"resid_{layer}"] = MR_effect
-        edges[f"attn_{layer}"][f"resid_{layer}"] = AR_effect
-
+        resid, mlp, attn = resids[layer], mlps[layer], attns[layer]
+        edges[f"mlp_{layer}"][f"resid_{layer}"] = N(mlp, resid)
+        edges[f"attn_{layer}"][f"resid_{layer}"] = N(attn, resid, [mlp])
         if not parallel_attn:
-            AM_effect = N(attn, mlp)
-            edges[f"attn_{layer}"][f"mlp_{layer}"] = AM_effect
+            edges[f"attn_{layer}"][f"mlp_{layer}"] = N(attn, mlp)
 
-        if layer > 0:
-            prev_resid = resids[layer - 1]
-        else:
-            prev_resid = embed
-
+        prev_resid = resids[layer - 1] if layer > 0 else embed
         if prev_resid is not None:
-            RM_effect = N(prev_resid, mlp, [attn])
-            RA_effect = N(prev_resid, attn)
-            RR_effect = N(prev_resid, resid, [mlp, attn])
-
             if layer > 0:
-                edges[f"resid_{layer - 1}"][f"mlp_{layer}"] = RM_effect
-                edges[f"resid_{layer - 1}"][f"attn_{layer}"] = RA_effect
-                edges[f"resid_{layer - 1}"][f"resid_{layer}"] = RR_effect
+                edges[f"resid_{layer - 1}"][f"mlp_{layer}"] = N(prev_resid, mlp, [attn])
+                edges[f"resid_{layer - 1}"][f"attn_{layer}"] = N(prev_resid, attn)
+                edges[f"resid_{layer - 1}"][f"resid_{layer}"] = N(prev_resid, resid, [mlp, attn])
             else:
-                edges["embed"][f"mlp_{layer}"] = RM_effect
-                edges["embed"][f"attn_{layer}"] = RA_effect
-                edges["embed"]["resid_0"] = RR_effect
+                edges["embed"][f"mlp_{layer}"] = N(prev_resid, mlp, [attn])
+                edges["embed"][f"attn_{layer}"] = N(prev_resid, attn)
+                edges["embed"]["resid_0"] = N(prev_resid, resid, [mlp, attn])
 
-    print("   DEBUG: Reformatting Matrices...")
+    # Reformat
     for child in edges:
         bc, sc, fc = nodes[child].act.shape
         for parent in edges[child]:
-            weight_matrix = edges[child][parent]
             if parent == "y":
-                weight_matrix = sparse_reshape(weight_matrix, (bc, sc, fc + 1))
-            else:
-                continue
-            edges[child][parent] = weight_matrix
+                edges[child][parent] = sparse_reshape(edges[child][parent], (bc, sc, fc + 1))
 
-    if aggregation == "sum":
-        for child in edges:
-            for parent in edges[child]:
-                weight_matrix = edges[child][parent]
-                if parent == "y":
-                    weight_matrix = weight_matrix.sum(dim=1)
-                else:
-                    weight_matrix = weight_matrix.sum(dim=(1, 4))
-                edges[child][parent] = weight_matrix
-        for node in nodes:
-            if node != "y":
-                nodes[node] = nodes[node].sum(dim=1)
-
-        for child in edges:
-            bc, _ = nodes[child].act.shape
-            for parent in edges[child]:
-                weight_matrix = edges[child][parent]
-                if parent == "y":
-                    weight_matrix = weight_matrix.sum(dim=0) / bc
-                else:
-                    bp, _ = nodes[parent].act.shape
-                    assert bp == bc
-                    weight_matrix = weight_matrix.sum(dim=(0, 2)) / bc
-                edges[child][parent] = weight_matrix
-        for node in nodes:
-            if node != "y":
-                nodes[node] = nodes[node].mean(dim=0)
-
-    elif aggregation == "none":
+    if aggregation == "none":
         for child in edges:
             bc, sc, fc = nodes[child].act.shape
             for parent in edges[child]:
-                weight_matrix = edges[child][parent]
                 if parent == "y":
-                    weight_matrix = sparse_reshape(weight_matrix, (bc, sc, fc + 1))
-                    weight_matrix = weight_matrix.sum(dim=0) / bc
+                    edges[child][parent] = edges[child][parent].sum(dim=0) / bc
                 else:
-                    bp, sp, fp = nodes[parent].act.shape
-                    assert bp == bc
-                    weight_matrix = weight_matrix.sum(dim=(0, 3)) / bc
-                edges[child][parent] = weight_matrix
+                    edges[child][parent] = edges[child][parent].sum(dim=(0, 3)) / bc
         for node in nodes:
-            # Mean converts SparseAct to Tensor
             nodes[node] = nodes[node].mean(dim=0)
 
-    return nodes, dict(edges)
+    return nodes, dict(edges), active_features_dict, dynamic_threshold
 
 if __name__ == "__main__":
-    # HARDCODED DEFAULTS
     MODEL_ID = "EleutherAI/pythia-70m-deduped"
     DATASET = "rc_train"
     NUM_EXAMPLES = 5 
     BATCH_SIZE = 1
     
-    print("🚀 Starting Fast Circuit Discovery (Final V4)...")
-    
-    # 1. Setup Device
-    device = "cuda" if t.cuda.is_available() else "cpu"
+    print("🚀 Starting Diagnostic Circuit Discovery (Version 7 - Import Fix)...")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"🖥️ Device: {device}")
 
-    # 2. Load Model
-    print("⏳ Loading Model...")
-    dtype = t.float32
+    dtype = torch.float32
     model = LanguageModel(MODEL_ID, device_map=device, torch_dtype=dtype)
-    print("✅ Model Loaded.")
-
-    # 3. Load Data
-    print("📖 Loading Data...")
-    data_path = f"data/{DATASET}.json"
-    examples = load_examples(data_path, NUM_EXAMPLES, model, use_min_length_only=True)
-    num_examples = min(len(examples), NUM_EXAMPLES)
     
-    batch = examples[:BATCH_SIZE]
-    print(f"⚡ Processing 1 batch of {BATCH_SIZE} example(s)...")
-
-    # 4. Load Autoencoders
     print("📚 Loading Autoencoders...")
     submodules, dictionaries = load_saes_and_submodules(
-        model,
-        separate_by_type=True,
-        include_embed=True,
-        neurons=False,
-        device=device,
-        dtype=dtype,
+        model, separate_by_type=True, include_embed=True, neurons=False, device=device, dtype=dtype,
     )
 
-    # 5. Prep Inputs
+    data_path = f"data/{DATASET}.json"
+    examples = load_examples(data_path, NUM_EXAMPLES, model, use_min_length_only=True)
+    batch = examples[:BATCH_SIZE]
+    
     clean_inputs = [e["clean_prefix"] for e in batch]
-    clean_answer_idxs = t.tensor(
-        [model.tokenizer(e["clean_answer"]).input_ids[-1] for e in batch],
-        dtype=t.long,
-        device=device,
-    )
+    clean_answer_idxs = torch.tensor([model.tokenizer(e["clean_answer"]).input_ids[-1] for e in batch], dtype=torch.long, device=device)
     patch_inputs = [e["patch_prefix"] for e in batch]
-    patch_answer_idxs = t.tensor(
-        [model.tokenizer(e["patch_answer"]).input_ids[-1] for e in batch],
-        dtype=t.long,
-        device=device,
-    )
+    patch_answer_idxs = torch.tensor([model.tokenizer(e["patch_answer"]).input_ids[-1] for e in batch], dtype=torch.long, device=device)
 
-    # 6. Define Metric
     def metric_fn(model, **kwargs):
         logits = model.output.logits[:, -1, :]
-        return t.gather(
-            logits, dim=-1, index=patch_answer_idxs.view(-1, 1)
-        ).squeeze(-1) - t.gather(
-            logits, dim=-1, index=clean_answer_idxs.view(-1, 1)
-        ).squeeze(-1)
+        return torch.gather(logits, dim=-1, index=patch_answer_idxs.view(-1, 1)).squeeze(-1) - \
+               torch.gather(logits, dim=-1, index=clean_answer_idxs.view(-1, 1)).squeeze(-1)
 
-    # 7. RUN CIRCUIT
-    print("▶️ Executing Circuit Logic...")
-    nodes, edges = get_circuit_fast(
-        clean_inputs,
-        patch_inputs,
-        model,
-        submodules.embed,
-        submodules.attns,
-        submodules.mlps,
-        submodules.resids,
-        dictionaries,
-        metric_fn,
-        nodes_only=False,
-        aggregation="none",
-        node_threshold=0.1,
+    # RUN
+    nodes, edges, active_features, final_threshold = get_circuit_diagnostic(
+        clean_inputs, patch_inputs, model,
+        submodules.embed, submodules.attns, submodules.mlps, submodules.resids, dictionaries,
+        metric_fn, nodes_only=False, aggregation="none", 
         parallel_attn=True,
     )
-    print("🎉 Circuit Computed Successfully!")
 
-    # 8. Save Results
-    save_dir = "circuits"
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    
-    save_path = f"{save_dir}/debug_circuit.pt"
-    save_dict = {"examples": examples, "nodes": nodes, "edges": edges}
-    
-    try:
-        t.save(save_dict, save_path)
-        print(f"💾 Saved circuit to: {save_path}")
-    except Exception as e:
-        print(f"❌ Error saving (skipping): {e}")
-
-    # 9. Plotting
-    print("🎨 Generating Plot...")
-    plot_dir = "circuits/figures"
-    if not os.path.exists(plot_dir):
-        os.makedirs(plot_dir)
+    if nodes is not None:
+        print("🎉 Circuit Computed Successfully!")
         
-    annotations = None
-    if os.path.exists(f"annotations/pythia-70m-deduped.jsonl"):
-        annotations = {}
-        with open(f"annotations/pythia-70m-deduped.jsonl", "r") as f:
-            for line in f:
-                line = json.loads(line)
-                if "Annotation" in line:
-                    annotations[line["Name"]] = line["Annotation"]
+        save_dir = "circuits"
+        if not os.path.exists(save_dir): os.makedirs(save_dir)
+        save_path = f"{save_dir}/debug_circuit.pt"
+        save_dict = {
+            "examples": examples, 
+            "nodes": nodes, 
+            "edges": edges, 
+            "active_features": active_features,
+            "used_threshold": final_threshold
+        }
+        
+        torch.save(save_dict, save_path)
+        print(f"💾 Saved circuit to: {save_path}")
 
-    # --- FIX 4: Wrapper for Plotter ---
-    class PlotWrapper:
-        def __init__(self, tensor):
-            self.act = tensor
-            # Helper for max/min calculations in to_hex
-            self.to_tensor = lambda: self.act
-    
-    # Wrap raw tensors so the plotter sees .act
-    plot_nodes = {
-        k: PlotWrapper(v) if not hasattr(v, 'act') else v 
-        for k, v in nodes.items()
-    }
+        print("🎨 Generating Plot...")
+        plot_dir = "circuits/figures"
+        if not os.path.exists(plot_dir): os.makedirs(plot_dir)
+        
+        annotations = None
+        if os.path.exists(f"annotations/pythia-70m-deduped.jsonl"):
+            annotations = {}
+            with open(f"annotations/pythia-70m-deduped.jsonl", "r") as f:
+                for line in f:
+                    data = json.loads(line)
+                    if "Annotation" in data: annotations[data["Name"]] = data["Annotation"]
 
-    plot_circuit_posaligned(
-        plot_nodes,
-        edges,
-        layers=6,
-        example_text=examples[0]["clean_prefix"],
-        node_threshold=0.1,
-        edge_threshold=0.01,
-        pen_thickness=1,
-        annotations=annotations,
-        save_dir=f"{plot_dir}/debug_plot",
-        gemma_mode=False,
-        parallel_attn=True,
-    )
-    print(f"🖼️ Plot saved to: {plot_dir}/debug_plot.png")
-    print("✅ DONE.")
+        class PlotWrapper:
+            def __init__(self, tensor):
+                self.act = tensor
+                self.to_tensor = lambda: self.act
+        
+        plot_nodes = {k: PlotWrapper(v) if not hasattr(v, 'act') else v for k, v in nodes.items()}
+
+        plot_circuit_posaligned(
+            plot_nodes, edges, layers=6, example_text=examples[0]["clean_prefix"],
+            node_threshold=final_threshold, 
+            edge_threshold=0.01, pen_thickness=1,
+            annotations=annotations, save_dir=f"{plot_dir}/debug_plot", gemma_mode=False, parallel_attn=True,
+        )
+        print(f"🖼️ Plot saved to: {plot_dir}/debug_plot.png")
+        print("✅ DONE.")
