@@ -6,8 +6,6 @@ import os
 import sys
 from collections import defaultdict
 
-# FIX: Import torch directly so both 'torch' and 't' work if needed, 
-# but we will use 'torch' everywhere to be safe.
 import torch
 import torch as t 
 
