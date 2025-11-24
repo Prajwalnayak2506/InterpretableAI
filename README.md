@@ -16,7 +16,8 @@ We introduce a novel methodology combining **Fast Attribution Patching** with **
 │   ├── labeling.py           # Step 4: Run FFT to label features
 │   └── visualization.py      # Step 5: Publication-ready plots
 ├── circuits/                 # Saved .pt circuit files
-└── results/                  # Final CSVs and figures
+├── final_results/            # Final CSVs and figures
+└── demo_visuals/             # Plots 
 ```
 
 ---
