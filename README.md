@@ -11,11 +11,10 @@ We introduce a novel methodology combining **Fast Attribution Patching** with **
 ```
 ├── src/
 │   ├── circuit_fast.py       # Step 1: Discover the circuit using IG
-│   ├── step2_get_signals.py  # Step 2: Extract time-series activations
-│   ├── step3_analysis.py     # Step 3: Generate topology statistics (CSV)
-│   ├── step4_fft_labeling.py # Step 4: Run FFT to label features
+│   ├── get_signals.py        # Step 2: Extract time-series activations
+│   ├── circuit_analysis.py   # Step 3: Generate topology statistics (CSV)
+│   ├── labeling.py           # Step 4: Run FFT to label features
 │   └── visualization.py      # Step 5: Publication-ready plots
-├── experiments/              # Runner scripts for different tasks
 ├── circuits/                 # Saved .pt circuit files
 └── results/                  # Final CSVs and figures
 ```
@@ -30,7 +29,7 @@ We introduce a novel methodology combining **Fast Attribution Patching** with **
 pip install -r requirements.txt
 ```
 
-### **2. Circuit Discovery (The Heavy Lifting)**
+### **2. Circuit Discovery**
 
 Run the fast-path attribution patching to find the causal circuit for Subject–Verb Agreement.
 
@@ -40,8 +39,6 @@ python src/circuit_fast.py
 
 **Output:** `circuits/debug_circuit.pt` → Contains the sparse subgraph of discovered features.
 
----
-
 ### **3. Signal Extraction & Probing**
 
 We support multiple probing experiments to test robustness.
@@ -49,18 +46,14 @@ We support multiple probing experiments to test robustness.
 #### **Experiment A: Standard Plurality Probe**
 
 ```bash
-python src/step2_get_signals.py --output signals_plural.pt
+python src/get_signals.py --output signals_plural.pt
 ```
 
 #### **Experiment B: Gender Agreement Probe (Generalization Test)**
 
 ```bash
-python src/step2_get_signals.py \
-  --text "The boy washes his face. The girl washes her face." \
-  --output signals_gender.pt
+python src/get_signals.py --text "The boy washes his face. The girl washes her face." --output signals_gender.pt
 ```
-
----
 
 ### **4. Analysis & Visualization**
 
@@ -69,7 +62,53 @@ Generate spectral labels and paper-ready plots.
 #### **Label the features (Induction vs. Semantic)**
 
 ```bash
-python src/step4_fft_labeling.py
+python src/labeling.py
 ```
 
-#### **Generate Demo Plots
+#### **Generate Demo Plots**
+
+```bash
+python src/visualization.py --file signals_plural.pt --title "Subject-Verb Agreement"
+python src/visualization.py --file signals_gender.pt --title "Gender Agreement"
+```
+
+---
+
+## 🎯 Key Features
+
+* **⚡ Fast Circuit Discovery**: Single-step gradient approximation instead of expensive integrated gradients
+* **🏷️ Automated Feature Labeling**: FFT-based classification of features into functional roles
+* **🔄 Zero-Shot Generalization**: Same pipeline works for multiple syntactic phenomena
+* **📊 Quantitative Interpretability**: Signal processing approach instead of qualitative inspection
+
+---
+
+## 📊 Output Examples
+
+* **Circuit Diagrams**: Visualize causal graphs of discovered features
+* **Activation Plots**: Time-series signals of feature activations
+* **Spectral Analysis**: FFT spectra showing dominant frequencies
+* **Automated Labels**: CSV files with feature classifications
+
+---
+
+## 🛠️ Technical Details
+
+**Model**: Pythia-70m-deduped
+**Framework**: nnsight + PyTorch
+**Analysis**: Fast Fourier Transform (FFT) spectral analysis
+**Feature Types**: Induction, Semantic, Rhythmic, Noise
+
+---
+
+## 👥 Authors
+
+* Juee Jahagirdar (IIT Bombay)
+* Prajwal Nayak (IIT Bombay)
+* Sarvadnya Purkar (IIT Bombay)
+
+---
+
+## 📄 License
+
+This project is for academic research purposes.
